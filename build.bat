@@ -9,7 +9,8 @@ if not defined VSDIR (
 )
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 
-cl /nologo /utf-8 /std:c++17 /O1 /MT /W4 /EHsc /DUNICODE /D_UNICODE hush.cpp /Fe:Hush.exe ^
+rc /nologo /fo hush.res hush.rc || exit /b 1
+cl /nologo /utf-8 /std:c++17 /O1 /MT /W4 /EHsc /DUNICODE /D_UNICODE hush.cpp hush.res /Fe:Hush.exe ^
    /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF || exit /b 1
-del /q hush.obj 2>nul
+del /q hush.obj hush.res 2>nul
 echo Built Hush.exe

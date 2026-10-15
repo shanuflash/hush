@@ -61,7 +61,7 @@ enum : DWORD { BIND_MOUSE = 0, BIND_KEY = 1 };
 enum : DWORD { SCOPE_ALL = 0, SCOPE_DEFAULT = 1 };
 enum : DWORD { OVL_OFF = 0, OVL_MUTED = 1, OVL_ALWAYS = 2, OVL_FLASH = 3, OVL_LIVE = 4 };
 enum : DWORD { POS_TL = 0, POS_TC, POS_TR, POS_BL, POS_BC, POS_BR };
-enum : DWORD { STYLE_CAPSULE = 0, STYLE_ORB, STYLE_EDGE, STYLE_TILE, STYLE_CORNER };
+enum : DWORD { STYLE_CAPSULE = 0, STYLE_ORB, STYLE_EDGE, STYLE_CHIP, STYLE_CORNER };
 
 struct Settings {
     DWORD mode = MODE_TOGGLE;
@@ -347,12 +347,9 @@ static float SegDist(float px, float py, float ax, float ay, float bx, float by)
     return std::sqrt(ex * ex + ey * ey);
 }
 
-// Mic glyph, ARGB straight alpha.
-// withDisc: coloured disc with a white mic (tray, Capsule, Orb).
-// Otherwise the mic itself takes the state colour on transparent (Tile) and the slash gap is cut out.
-static std::vector<uint32_t> RenderMicGlyph(bool muted, int size, bool withDisc = true) {
-    const uint32_t state = muted ? kRed : kGreen;
-    const uint32_t fg = withDisc ? 0xFFFFFF : state;
+// Coloured disc with a white mic (slashed when muted). ARGB, straight alpha.
+static std::vector<uint32_t> RenderMicGlyph(bool muted, int size) {
+    const uint32_t bg = muted ? kRed : kGreen;
     std::vector<uint32_t> px(size * size);
     const int ss = 4;
     for (int y = 0; y < size; y++) {
@@ -362,29 +359,20 @@ static std::vector<uint32_t> RenderMicGlyph(bool muted, int size, bool withDisc 
                 for (int sx = 0; sx < ss; sx++) {
                     float u = (x + (sx + 0.5f) / ss) / size;
                     float v = (y + (sy + 0.5f) / ss) / size;
-                    bool has = false;
-                    uint32_t c = 0;
-                    if (withDisc) {
-                        float dc = std::sqrt((u - 0.5f) * (u - 0.5f) + (v - 0.5f) * (v - 0.5f));
-                        if (dc > 0.5f) continue;
-                        has = true;
-                        c = state;
-                    }
+                    float dc = std::sqrt((u - 0.5f) * (u - 0.5f) + (v - 0.5f) * (v - 0.5f));
+                    if (dc > 0.5f) continue;
+                    uint32_t c = bg;
                     float da = std::sqrt((u - 0.5f) * (u - 0.5f) + (v - 0.47f) * (v - 0.47f));
                     bool mic = SegDist(u, v, 0.5f, 0.27f, 0.5f, 0.47f) <= 0.12f ||
                                (std::fabs(da - 0.205f) <= 0.04f && v >= 0.47f) ||
                                SegDist(u, v, 0.5f, 0.675f, 0.5f, 0.77f) <= 0.04f ||
                                SegDist(u, v, 0.39f, 0.77f, 0.61f, 0.77f) <= 0.04f;
-                    if (mic) { has = true; c = fg; }
+                    if (mic) c = 0xFFFFFF;
                     if (muted) {
                         float ds = SegDist(u, v, 0.24f, 0.22f, 0.76f, 0.80f);
-                        if (ds <= 0.095f) {
-                            if (withDisc) c = state;
-                            else has = false;
-                        }
-                        if (ds <= 0.045f) { has = true; c = fg; }
+                        if (ds <= 0.095f) c = bg;
+                        if (ds <= 0.045f) c = 0xFFFFFF;
                     }
-                    if (!has) continue;
                     r += (c >> 16) & 0xFF; g += (c >> 8) & 0xFF; b += c & 0xFF; a += 255;
                 }
             }
@@ -461,12 +449,6 @@ static Mask Placed(const Mask& src, int w, int h, int ox, int oy) {
             int tx = ox + x, ty = oy + y;
             if (tx >= 0 && ty >= 0 && tx < w && ty < h) m.a[(size_t)ty * w + tx] = src.a[(size_t)y * src.w + x];
         }
-    return m;
-}
-
-static Mask AlphaOf(const std::vector<uint32_t>& img, int size) {
-    Mask m(size, size);
-    for (size_t i = 0; i < img.size(); i++) m.a[i] = (img[i] >> 24) / 255.f;
     return m;
 }
 
@@ -630,18 +612,23 @@ static Badge BuildEdge(bool muted, bool bottom, float s) {
     return {std::move(cv), {P, P, P + W, P + bodyH}};
 }
 
-static Badge BuildTile(bool muted, float s) {
+// Compact Capsule: glowing dot and one word.
+static Badge BuildChip(bool muted, float s) {
     const uint32_t c = muted ? kRed : kGreen;
-    const int sz = Px(32, s), g = Px(22, s), P = Px(28, s);
-    Canvas cv(sz + 2 * P, sz + 2 * P);
-    PaintMaterial(cv, (float)P, (float)P, (float)sz, (float)sz, (float)Px(10, s), s);
-    std::vector<uint32_t> img = RenderMicGlyph(muted, g, false);
-    const int gp = P + (sz - g) / 2;
-    Mask glow = Placed(AlphaOf(img, g), cv.w, cv.h, gp, gp);
-    Blur(glow, 2.5f * s);
-    cv.Fill(glow, 0, 0, c, 0.45f);
-    cv.Image(img, g, gp, gp);
-    return {std::move(cv), {P, P, P + sz, P + sz}};
+    const int spacing = Px(1.32f, s);
+    Mask t = TextMask(muted ? L"MUTED" : L"LIVE", Px(11, s), spacing);
+    const int h = Px(24, s), dot = Px(7, s), padL = Px(9, s), gap = Px(7, s), padR = Px(11, s), P = Px(28, s);
+    const int w = padL + dot + gap + t.w - spacing + padR;  // GDI adds spacing after the last letter too
+    Canvas cv(w + 2 * P, h + 2 * P);
+    PaintMaterial(cv, (float)P, (float)P, (float)w, (float)h, h / 2.f, s);
+    const float cx = P + padL + dot / 2.f, cy = P + h / 2.f;
+    Mask led = MakeMask(cv.w, cv.h, [&](float px, float py) { return Coverage(std::hypot(px - cx, py - cy) - dot / 2.f); });
+    Mask glow = led;
+    Blur(glow, 3.5f * s);
+    cv.Fill(glow, 0, 0, c, 0.8f);
+    cv.Fill(led, 0, 0, c, 1.f);
+    cv.Fill(t, P + padL + dot + gap, P + (h - t.h) / 2, 0xFFFFFF, 1.f);
+    return {std::move(cv), {P, P, P + w, P + h}};
 }
 
 static Badge BuildCorner(bool muted, DWORD pos, float s) {
@@ -699,7 +686,7 @@ static void PaintOverlay() {
     const bool muted = g_overlayMuted;
     Badge b = style == STYLE_ORB    ? BuildOrb(muted, s)
             : style == STYLE_EDGE   ? BuildEdge(muted, pos >= POS_BL, s)
-            : style == STYLE_TILE   ? BuildTile(muted, s)
+            : style == STYLE_CHIP   ? BuildChip(muted, s)
             : style == STYLE_CORNER ? BuildCorner(muted, pos, s)
                                     : BuildCapsule(muted, g_overlayLabel, s);
 
@@ -1028,7 +1015,7 @@ static void ShowMenu(int x, int y) {
     AppendMenuW(m, MF_POPUP, (UINT_PTR)ovl, L"On-screen indicator");
 
     HMENU look = CreatePopupMenu();
-    static const wchar_t* styleNames[] = {L"Capsule", L"Orb", L"Edge", L"Tile", L"Corner"};
+    static const wchar_t* styleNames[] = {L"Capsule", L"Orb", L"Edge", L"Chip", L"Corner"};
     for (DWORD i = STYLE_CAPSULE; i <= STYLE_CORNER; i++)
         AppendMenuW(look, MF_STRING | chk(g_cfg.overlayStyle == i), ID_STYLE_FIRST + i, styleNames[i]);
     AppendMenuW(m, MF_POPUP, (UINT_PTR)look, L"Indicator style");

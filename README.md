@@ -20,7 +20,7 @@ Right-click the tray icon.
 
 - **Change hotkey**: press any mouse button except left/right, or any key. Esc cancels.
 - **Mode**: toggle, push to talk, or push to mute
-- **Indicator style**: Capsule, Orb, Edge, Tile or Corner
+- **Indicator style**: Capsule, Orb, Edge, Chip or Corner
 - **On-screen indicator**: off, flash on change, only while muted, only while live, or always
 - **Devices**: all microphones, or just the default one
 - **Play sounds**, **Start with Windows**

@@ -22,7 +22,8 @@ Right-click the tray icon.
 - **Mode**: toggle, push to talk, or push to mute
 - **Indicator**: when the on-screen badge shows (off, flash on change, only while muted, only while live, or always), its style (Capsule, Orb, Edge, Ghost or Glow), and where it sits (top center by default)
 - **Devices**: all microphones, or just the default one
-- **Play sounds**, **Start with Windows**
+- **Sounds**: turn feedback sounds on or off, pick a theme (Chirp or Discord), or pick your own .wav files for mute and unmute
+- **Start with Windows**
 
 ## Notes
 

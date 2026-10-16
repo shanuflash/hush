@@ -10,6 +10,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
+#include <commdlg.h>
 #include <shellscalingapi.h>
 #include <mmsystem.h>
 #include <mmdeviceapi.h>
@@ -33,6 +34,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -73,6 +75,21 @@ static bool IsStyle(DWORD v) {
     return false;
 }
 
+// Sound themes. Chirp is generated in code; every other theme's mute and unmute
+// .wav files are embedded in hush.rc as RCDATA kThemeResBase + 2*id and + 2*id + 1.
+// Ids are saved in settings, so never reuse one.
+enum : DWORD { THEME_CHIRP = 0, THEME_DISCORD = 1 };
+struct ThemeInfo { DWORD id; const wchar_t* name; };
+static const ThemeInfo kThemes[] = {
+    {THEME_CHIRP, L"Chirp"}, {THEME_DISCORD, L"Discord"},
+};
+static const int kThemeResBase = 200;
+static bool IsTheme(DWORD v) {
+    for (auto& t : kThemes)
+        if (t.id == v) return true;
+    return false;
+}
+
 struct Settings {
     DWORD mode = MODE_TOGGLE;
     DWORD bindKind = BIND_MOUSE;
@@ -83,6 +100,8 @@ struct Settings {
     DWORD overlay = OVL_FLASH;
     DWORD overlayPos = POS_TC;
     DWORD overlayStyle = STYLE_CAPSULE;
+    DWORD soundTheme = THEME_CHIRP;
+    std::wstring muteSound, unmuteSound;  // custom .wav files; empty = the theme's sound
 };
 
 static Settings g_cfg;
@@ -107,6 +126,18 @@ static bool LoadSettings() {
     get(L"OverlayPos", g_cfg.overlayPos, POS_BR);
     get(L"OverlayStyle", g_cfg.overlayStyle, STYLE_GLOW);
     if (!IsStyle(g_cfg.overlayStyle)) g_cfg.overlayStyle = STYLE_CAPSULE;  // a removed style
+    get(L"SoundTheme", g_cfg.soundTheme, 0xFF);
+    if (!IsTheme(g_cfg.soundTheme)) g_cfg.soundTheme = THEME_CHIRP;
+    auto getStr = [&](const wchar_t* name, std::wstring& v) {
+        wchar_t buf[MAX_PATH * 2];
+        DWORD sz = sizeof(buf) - sizeof(wchar_t), type;
+        if (RegQueryValueExW(k, name, nullptr, &type, (BYTE*)buf, &sz) == ERROR_SUCCESS && type == REG_SZ) {
+            buf[sz / sizeof(wchar_t)] = 0;
+            v = buf;
+        }
+    };
+    getStr(L"MuteSound", g_cfg.muteSound);
+    getStr(L"UnmuteSound", g_cfg.unmuteSound);
     RegCloseKey(k);
     return true;
 }
@@ -124,6 +155,13 @@ static void SaveSettings() {
     set(L"Overlay", g_cfg.overlay);
     set(L"OverlayPos", g_cfg.overlayPos);
     set(L"OverlayStyle", g_cfg.overlayStyle);
+    set(L"SoundTheme", g_cfg.soundTheme);
+    auto setStr = [&](const wchar_t* name, const std::wstring& v) {
+        if (v.empty()) RegDeleteValueW(k, name);
+        else RegSetValueExW(k, name, 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+    };
+    setStr(L"MuteSound", g_cfg.muteSound);
+    setStr(L"UnmuteSound", g_cfg.unmuteSound);
     RegCloseKey(k);
 }
 
@@ -305,10 +343,29 @@ static void WatchEndpoints() {
 }
 
 // ---------------------------------------------------------------------------
-// Feedback sounds (generated in memory, played async)
+// Feedback sounds: the theme's pair (generated or embedded) or the user's own
+// .wav files, loaded into memory once and played async.
 // ---------------------------------------------------------------------------
 
-static std::vector<BYTE> g_sndMute, g_sndUnmute;
+static std::vector<BYTE> g_sndMute, g_sndUnmute;    // current theme
+static std::vector<BYTE> g_userMute, g_userUnmute;  // custom files; empty = use the theme
+
+// Reads a .wav file whole. Returns nothing for a missing, oversized or non-WAV file.
+static std::vector<BYTE> LoadWav(const std::wstring& path) {
+    std::vector<BYTE> data;
+    if (path.empty()) return data;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return data;
+    LARGE_INTEGER size;
+    if (GetFileSizeEx(f, &size) && size.QuadPart > 44 && size.QuadPart <= 8 * 1024 * 1024) {
+        data.resize((size_t)size.QuadPart);
+        DWORD got = 0;
+        if (!ReadFile(f, data.data(), (DWORD)data.size(), &got, nullptr) || got != data.size()) data.clear();
+    }
+    CloseHandle(f);
+    if (data.size() < 12 || memcmp(data.data(), "RIFF", 4) != 0 || memcmp(data.data() + 8, "WAVE", 4) != 0) data.clear();
+    return data;
+}
 
 static std::vector<BYTE> MakeChirp(std::initializer_list<float> freqs, int msEach) {
     const int rate = 44100;
@@ -340,10 +397,51 @@ static std::vector<BYTE> MakeChirp(std::initializer_list<float> freqs, int msEac
     return buf;
 }
 
-static void PlayFeedback(bool muted) {
-    if (!g_cfg.sounds) return;
-    auto& b = muted ? g_sndMute : g_sndUnmute;
+// Copies an embedded .wav out of the exe, byte for byte.
+static std::vector<BYTE> LoadWavResource(int id) {
+    std::vector<BYTE> data;
+    HRSRC r = FindResourceW(nullptr, MAKEINTRESOURCEW(id), RT_RCDATA);
+    HGLOBAL g = r ? LoadResource(nullptr, r) : nullptr;
+    const BYTE* p = g ? (const BYTE*)LockResource(g) : nullptr;
+    if (p) data.assign(p, p + SizeofResource(nullptr, r));
+    return data;
+}
+
+static void LoadTheme(DWORD theme) {
+    PlaySoundW(nullptr, nullptr, 0);  // stop anything still playing from the buffers being replaced
+    if (theme != THEME_CHIRP) {
+        g_sndMute = LoadWavResource(kThemeResBase + 2 * theme);
+        g_sndUnmute = LoadWavResource(kThemeResBase + 2 * theme + 1);
+        if (!g_sndMute.empty() && !g_sndUnmute.empty()) return;
+    }
+    g_sndMute = MakeChirp({700.f, 440.f}, 70);
+    g_sndUnmute = MakeChirp({440.f, 700.f}, 70);
+}
+
+static void PlaySoundFor(bool muted) {
+    const auto& user = muted ? g_userMute : g_userUnmute;
+    const auto& b = !user.empty() ? user : muted ? g_sndMute : g_sndUnmute;
     PlaySoundW((LPCWSTR)b.data(), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+}
+
+static void PlayFeedback(bool muted) {
+    if (g_cfg.sounds) PlaySoundFor(muted);
+}
+
+static const wchar_t* ThemeName() {
+    for (auto& t : kThemes)
+        if (t.id == g_cfg.soundTheme) return t.name;
+    return kThemes[0].name;
+}
+
+// For the menu: the file's name, or the theme's.
+static std::wstring SoundName(bool muted) {
+    const std::wstring& path = muted ? g_cfg.muteSound : g_cfg.unmuteSound;
+    if (path.empty()) return ThemeName();
+    const wchar_t* slash = wcsrchr(path.c_str(), L'\\');
+    std::wstring name = slash ? slash + 1 : path;
+    if ((muted ? g_userMute : g_userUnmute).empty()) name += std::wstring(L" (can't play, using ") + ThemeName() + L")";
+    return name;
 }
 
 // ---------------------------------------------------------------------------
@@ -952,10 +1050,11 @@ enum : UINT {
     ID_MODE_TOGGLE = 10, ID_MODE_PTT, ID_MODE_PTM,
     ID_REBIND = 20,
     ID_SCOPE_ALL = 30, ID_SCOPE_DEFAULT,
-    ID_SOUNDS = 40, ID_AUTOSTART,
+    ID_SOUNDS = 40, ID_AUTOSTART, ID_SOUND_MUTE, ID_SOUND_UNMUTE,
     ID_OVL_OFF = 50, ID_OVL_MUTED, ID_OVL_ALWAYS, ID_OVL_FLASH, ID_OVL_LIVE,  // ID_OVL_OFF + OVL_*
     ID_POS_FIRST = 60,    // + POS_*
     ID_STYLE_FIRST = 70,  // + STYLE_*
+    ID_THEME_FIRST = 80,  // + THEME_*
     ID_EXIT = 99,
 };
 
@@ -1165,6 +1264,43 @@ static void SetScope(DWORD scope) {
     RefreshState();
 }
 
+// Let the user pick their own .wav for the mute or unmute sound, then play it once.
+static void ChooseSound(bool muted) {
+    std::wstring& path = muted ? g_cfg.muteSound : g_cfg.unmuteSound;
+    wchar_t file[MAX_PATH] = {};
+    lstrcpynW(file, path.c_str(), MAX_PATH);
+    OPENFILENAMEW ofn = {sizeof(ofn)};
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFilter = L"WAV sound (*.wav)\0*.wav\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = muted ? L"Choose the mute sound" : L"Choose the unmute sound";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+    if (!GetOpenFileNameW(&ofn)) return;
+    std::vector<BYTE> wav = LoadWav(file);
+    if (wav.empty()) {
+        Notify(L"Can't use that file", L"Pick a .wav file under 8 MB.");
+        return;
+    }
+    PlaySoundW(nullptr, nullptr, 0);  // stop anything still playing from the buffer being replaced
+    (muted ? g_userMute : g_userUnmute) = std::move(wav);
+    path = file;
+    SaveSettings();
+    PlaySoundFor(muted);
+}
+
+// Switch theme, dropping any custom files so the choice is actually heard, then preview it.
+static void SetTheme(DWORD theme) {
+    LoadTheme(theme);
+    g_userMute.clear();
+    g_userUnmute.clear();
+    g_cfg.muteSound.clear();
+    g_cfg.unmuteSound.clear();
+    g_cfg.soundTheme = theme;
+    SaveSettings();
+    PlaySoundFor(g_muted);
+}
+
 // ---------------------------------------------------------------------------
 // Dark menus: Win32 popup menus ignore the system theme unless the app opts in
 // through uxtheme's unnamed exports (stable since Windows 10 1809, build 17763).
@@ -1249,8 +1385,20 @@ static void ShowMenu(int x, int y) {
     }
     AppendMenuW(m, MF_POPUP, (UINT_PTR)ovl, L"Indicator");
 
+    HMENU snd = CreatePopupMenu();
+    AppendMenuW(snd, MF_STRING | chk(g_cfg.sounds != 0), ID_SOUNDS, L"Play sounds");
+    AppendMenuW(snd, MF_SEPARATOR, 0, nullptr);
+    for (auto& t : kThemes)
+        radio(snd, g_cfg.soundTheme == t.id, ID_THEME_FIRST + t.id, t.name);
+    AppendMenuW(snd, MF_SEPARATOR, 0, nullptr);
+    const std::wstring muteName = L"Mute: " + SoundName(true), unmuteName = L"Unmute: " + SoundName(false);
+    AppendMenuW(snd, MF_STRING | MF_GRAYED, 0, muteName.c_str());
+    AppendMenuW(snd, MF_STRING, ID_SOUND_MUTE, L"Choose mute sound…");
+    AppendMenuW(snd, MF_STRING | MF_GRAYED, 0, unmuteName.c_str());
+    AppendMenuW(snd, MF_STRING, ID_SOUND_UNMUTE, L"Choose unmute sound…");
+
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | chk(g_cfg.sounds != 0), ID_SOUNDS, L"Play sounds");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)snd, L"Sounds");
     AppendMenuW(m, MF_STRING | chk(AutostartEnabled()), ID_AUTOSTART, L"Start with Windows");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
@@ -1272,6 +1420,10 @@ static void ShowMenu(int x, int y) {
         FlashOverlay(g_muted, 1500);  // preview the new style
         return;
     }
+    if (cmd >= ID_THEME_FIRST && cmd < ID_EXIT && IsTheme(cmd - ID_THEME_FIRST)) {
+        SetTheme(cmd - ID_THEME_FIRST);
+        return;
+    }
     switch (cmd) {
         case ID_TOGGLE: ToggleMute(); break;
         case ID_MODE_TOGGLE: SetMode(MODE_TOGGLE); break;
@@ -1287,6 +1439,8 @@ static void ShowMenu(int x, int y) {
             UpdateOverlay(g_cfg.overlay == OVL_FLASH);  // flash once so the choice is visible
             break;
         case ID_SOUNDS: g_cfg.sounds = !g_cfg.sounds; SaveSettings(); break;
+        case ID_SOUND_MUTE: ChooseSound(true); break;
+        case ID_SOUND_UNMUTE: ChooseSound(false); break;
         case ID_AUTOSTART: SetAutostart(!AutostartEnabled()); break;
         case ID_EXIT: DestroyWindow(g_hwnd); break;
     }
@@ -1403,8 +1557,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             g_cfg.bindKind, g_cfg.bindCode, g_cfg.scope);
     }
 
-    g_sndMute = MakeChirp({700.f, 440.f}, 70);
-    g_sndUnmute = MakeChirp({440.f, 700.f}, 70);
+    LoadTheme(g_cfg.soundTheme);
+    g_userMute = LoadWav(g_cfg.muteSound);  // a missing file just falls back to the built-in sound
+    g_userUnmute = LoadWav(g_cfg.unmuteSound);
     int iconSize = GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem());
     g_iconLive = MakeTrayIcon(false, iconSize);
     g_iconMuted = MakeTrayIcon(true, iconSize);

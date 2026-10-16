@@ -71,7 +71,7 @@ struct Settings {
     DWORD scope = SCOPE_ALL;
     DWORD sounds = 1;
     DWORD overlay = OVL_FLASH;
-    DWORD overlayPos = POS_TR;
+    DWORD overlayPos = POS_TC;
     DWORD overlayStyle = STYLE_CAPSULE;
 };
 
@@ -504,11 +504,41 @@ struct Canvas {
     }
 };
 
+struct FontChoice { const wchar_t* face; int weight; };
+
+// Segoe UI Variable (Windows 11) at its Text optical size, else classic Segoe UI.
+// GDI exposes each named instance as its own family, truncated to 31 characters.
+static FontChoice BadgeFont() {
+    static const FontChoice kFaces[] = {
+        {L"Segoe UI Variable Text Semibold", FW_SEMIBOLD},
+        {L"Segoe UI Semibold", FW_SEMIBOLD},
+    };
+    static FontChoice chosen = [] {
+        HDC dc = GetDC(nullptr);
+        FontChoice pick = {L"Segoe UI", FW_BOLD};
+        for (auto& f : kFaces) {
+            LOGFONTW lf = {};
+            lf.lfCharSet = DEFAULT_CHARSET;
+            lstrcpynW(lf.lfFaceName, f.face, LF_FACESIZE);
+            bool found = false;
+            EnumFontFamiliesExW(dc, &lf, [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM p) -> int {
+                *(bool*)p = true;
+                return 0;
+            }, (LPARAM)&found, 0);
+            if (found) { pick = f; break; }
+        }
+        ReleaseDC(nullptr, dc);
+        return pick;
+    }();
+    return chosen;
+}
+
 // White-on-black GDI text read back as a coverage mask (GDI text has no alpha).
 static Mask TextMask(const wchar_t* text, int px, int spacing) {
     HDC dc = CreateCompatibleDC(nullptr);
-    HFONT font = CreateFontW(-px, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    const FontChoice fc = BadgeFont();
+    HFONT font = CreateFontW(-px, 0, 0, 0, fc.weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, fc.face);
     HGDIOBJ oldFont = SelectObject(dc, font);
     SetTextCharacterExtra(dc, spacing);
     const int len = lstrlenW(text);
@@ -671,6 +701,9 @@ static HWND g_overlay;
 static bool g_overlayVisible;
 static int g_overlayAlpha;
 static bool g_overlayMuted;
+static int g_fadeFrom, g_fadeTo;  // alpha animation, driven by TIMER_OVL_FADE
+static ULONGLONG g_fadeStart;
+static UINT g_fadeMs;
 static std::wstring g_overlayLabel;  // non-empty: a text prompt, always drawn as a Capsule
 
 static void PaintOverlay() {
@@ -717,7 +750,7 @@ static void PaintOverlay() {
         POINT dst = {vis.left, vis.top};
         SIZE size = {vis.right - vis.left, vis.bottom - vis.top};
         POINT src = {vis.left - win.left, vis.top - win.top};
-        BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        BLENDFUNCTION blend = {AC_SRC_OVER, 0, (BYTE)g_overlayAlpha, AC_SRC_ALPHA};
         UpdateLayeredWindow(g_overlay, screen, &dst, &size, mem, &src, 0, &blend, ULW_ALPHA);
         SelectObject(mem, oldBmp);
         DeleteObject(bmp);
@@ -731,12 +764,37 @@ static void SetOverlayAlpha(int alpha) {
     UpdateLayeredWindow(g_overlay, nullptr, nullptr, nullptr, nullptr, nullptr, 0, &blend, ULW_ALPHA);
 }
 
+static const UINT kFadeInMs = 140, kFadeOutMs = 240;
+
+// Animate alpha from its current value; the duration shrinks if we start part way.
+static void StartFade(int to, UINT fullMs) {
+    g_fadeFrom = g_overlayAlpha;
+    g_fadeTo = to;
+    g_fadeStart = GetTickCount64();
+    g_fadeMs = std::max(1u, (UINT)(fullMs * std::abs(to - g_overlayAlpha) / 255));
+    SetTimer(g_hwnd, TIMER_OVL_FADE, 10, nullptr);
+}
+
 static void HideOverlay() {
     KillTimer(g_hwnd, TIMER_OVL_HOLD);
     KillTimer(g_hwnd, TIMER_OVL_FADE);
     KillTimer(g_hwnd, TIMER_OVL_TOPMOST);
     ShowWindow(g_overlay, SW_HIDE);
     g_overlayVisible = false;
+    g_overlayAlpha = 0;
+}
+
+// Fade in eases out (fast start, soft landing); fade out eases in and out.
+static void StepFade() {
+    float t = Clamp01((float)(GetTickCount64() - g_fadeStart) / g_fadeMs);
+    float e = g_fadeTo > g_fadeFrom ? 1 - (1 - t) * (1 - t) * (1 - t)
+                                    : t < 0.5f ? 4 * t * t * t : 1 - std::pow(-2 * t + 2, 3.f) / 2;
+    g_overlayAlpha = (int)(g_fadeFrom + (g_fadeTo - g_fadeFrom) * e + 0.5f);
+    if (t >= 1) {
+        KillTimer(g_hwnd, TIMER_OVL_FADE);
+        if (g_fadeTo == 0) { HideOverlay(); return; }
+    }
+    SetOverlayAlpha(g_overlayAlpha);
 }
 
 static void ShowOverlay(bool muted, const std::wstring& label = L"") {
@@ -744,11 +802,12 @@ static void ShowOverlay(bool muted, const std::wstring& label = L"") {
     KillTimer(g_hwnd, TIMER_OVL_FADE);
     g_overlayMuted = muted;
     g_overlayLabel = label;
+    if (!g_overlayVisible) g_overlayAlpha = 0;  // appear from nothing; a mid-fade badge picks up where it is
     PaintOverlay();
-    g_overlayAlpha = 255;
     SetWindowPos(g_overlay, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     g_overlayVisible = true;
+    if (g_overlayAlpha < 255) StartFade(255, kFadeInMs);
     // Borderless games can sit above other topmost windows; re-assert now and then.
     SetTimer(g_hwnd, TIMER_OVL_TOPMOST, 2000, nullptr);
 }
@@ -974,6 +1033,41 @@ static void SetScope(DWORD scope) {
     RefreshState();
 }
 
+// ---------------------------------------------------------------------------
+// Dark menus: Win32 popup menus ignore the system theme unless the app opts in
+// through uxtheme's unnamed exports (stable since Windows 10 1809, build 17763).
+// ---------------------------------------------------------------------------
+
+using FnSetPreferredAppMode = int(WINAPI*)(int);              // #135 (1809: AllowDarkModeForApp(BOOL))
+using FnAllowDarkModeForWindow = bool(WINAPI*)(HWND, bool);   // #133
+using FnThemeVoid = void(WINAPI*)();                          // #104 RefreshImmersiveColorPolicyState, #136 FlushMenuThemes
+static FnThemeVoid g_refreshColorPolicy, g_flushMenuThemes;
+
+static bool BuildAtLeast(DWORD build) {
+    using FnRtlGetVersion = LONG(WINAPI*)(OSVERSIONINFOW*);
+    auto rtl = (FnRtlGetVersion)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    OSVERSIONINFOW v = {sizeof(v)};
+    return rtl && rtl(&v) == 0 && v.dwBuildNumber >= build;
+}
+
+static void ApplyMenuTheme() {
+    if (g_refreshColorPolicy) g_refreshColorPolicy();
+    if (g_flushMenuThemes) g_flushMenuThemes();
+}
+
+static void InitDarkMenus(HWND owner) {
+    if (!BuildAtLeast(17763)) return;  // ordinals mean other things on older builds
+    HMODULE ux = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!ux) return;
+    auto setMode = (FnSetPreferredAppMode)GetProcAddress(ux, MAKEINTRESOURCEA(135));
+    auto allowWindow = (FnAllowDarkModeForWindow)GetProcAddress(ux, MAKEINTRESOURCEA(133));
+    g_refreshColorPolicy = (FnThemeVoid)GetProcAddress(ux, MAKEINTRESOURCEA(104));
+    g_flushMenuThemes = (FnThemeVoid)GetProcAddress(ux, MAKEINTRESOURCEA(136));
+    if (setMode) setMode(1);  // AllowDark: follow the system light/dark setting
+    if (allowWindow) allowWindow(owner, true);
+    ApplyMenuTheme();
+}
+
 static void ShowMenu(int x, int y) {
     RefreshState();
     HMENU m = CreatePopupMenu();
@@ -981,6 +1075,10 @@ static void ShowMenu(int x, int y) {
     HMENU scope = CreatePopupMenu();
     HMENU ovl = CreatePopupMenu();
     auto chk = [](bool b) { return b ? MF_CHECKED : MF_UNCHECKED; };
+    // Pick-one groups get a dot instead of a checkmark.
+    auto radio = [&](HMENU menu, bool on, UINT id, const wchar_t* text, UINT extra = 0) {
+        AppendMenuW(menu, MF_STRING | MFT_RADIOCHECK | chk(on) | extra, id, text);
+    };
 
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, g_muted ? L"Microphone: MUTED" : L"Microphone: LIVE");
     AppendMenuW(m, MF_STRING, ID_TOGGLE, g_muted ? L"Unmute" : L"Mute");
@@ -990,35 +1088,34 @@ static void ShowMenu(int x, int y) {
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, hk.c_str());
     AppendMenuW(m, MF_STRING, ID_REBIND, L"Change hotkey…");
 
-    AppendMenuW(mode, MF_STRING | chk(g_cfg.mode == MODE_TOGGLE), ID_MODE_TOGGLE, L"Toggle");
-    AppendMenuW(mode, MF_STRING | chk(g_cfg.mode == MODE_PTT), ID_MODE_PTT, L"Push to talk");
-    AppendMenuW(mode, MF_STRING | chk(g_cfg.mode == MODE_PTM), ID_MODE_PTM, L"Push to mute");
+    radio(mode, g_cfg.mode == MODE_TOGGLE, ID_MODE_TOGGLE, L"Toggle");
+    radio(mode, g_cfg.mode == MODE_PTT, ID_MODE_PTT, L"Push to talk");
+    radio(mode, g_cfg.mode == MODE_PTM, ID_MODE_PTM, L"Push to mute");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)mode, L"Mode");
 
-    AppendMenuW(scope, MF_STRING | chk(g_cfg.scope == SCOPE_ALL), ID_SCOPE_ALL, L"All microphones");
-    AppendMenuW(scope, MF_STRING | chk(g_cfg.scope == SCOPE_DEFAULT), ID_SCOPE_DEFAULT, L"Default microphone only");
+    radio(scope, g_cfg.scope == SCOPE_ALL, ID_SCOPE_ALL, L"All microphones");
+    radio(scope, g_cfg.scope == SCOPE_DEFAULT, ID_SCOPE_DEFAULT, L"Default microphone only");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)scope, L"Devices");
 
-    AppendMenuW(ovl, MF_STRING | chk(g_cfg.overlay == OVL_OFF), ID_OVL_OFF, L"Off");
-    AppendMenuW(ovl, MF_STRING | chk(g_cfg.overlay == OVL_FLASH), ID_OVL_FLASH, L"Flash on change");
-    AppendMenuW(ovl, MF_STRING | chk(g_cfg.overlay == OVL_MUTED), ID_OVL_MUTED, L"Only while muted");
-    AppendMenuW(ovl, MF_STRING | chk(g_cfg.overlay == OVL_LIVE), ID_OVL_LIVE, L"Only while live");
-    AppendMenuW(ovl, MF_STRING | chk(g_cfg.overlay == OVL_ALWAYS), ID_OVL_ALWAYS, L"Always (muted and live)");
+    // One indicator submenu, three groups: when it shows, what it looks like, where it sits.
+    radio(ovl, g_cfg.overlay == OVL_OFF, ID_OVL_OFF, L"Off");
+    radio(ovl, g_cfg.overlay == OVL_FLASH, ID_OVL_FLASH, L"Flash on change");
+    radio(ovl, g_cfg.overlay == OVL_MUTED, ID_OVL_MUTED, L"Only while muted");
+    radio(ovl, g_cfg.overlay == OVL_LIVE, ID_OVL_LIVE, L"Only while live");
+    radio(ovl, g_cfg.overlay == OVL_ALWAYS, ID_OVL_ALWAYS, L"Always");
+    AppendMenuW(ovl, MF_SEPARATOR, 0, nullptr);
+    static const wchar_t* styleNames[] = {L"Capsule", L"Orb", L"Edge", L"Chip", L"Corner"};
+    for (DWORD i = STYLE_CAPSULE; i <= STYLE_CORNER; i++)
+        radio(ovl, g_cfg.overlayStyle == i, ID_STYLE_FIRST + i, styleNames[i]);
     AppendMenuW(ovl, MF_SEPARATOR, 0, nullptr);
     static const wchar_t* posNames[] = {L"Top left", L"Top center", L"Top right",
                                         L"Bottom left", L"Bottom center", L"Bottom right"};
     const DWORD effPos = EffectivePos(g_cfg.overlayStyle, g_cfg.overlayPos);
     for (DWORD i = POS_TL; i <= POS_BR; i++) {
         UINT allowed = EffectivePos(g_cfg.overlayStyle, i) == i ? 0 : MF_GRAYED;
-        AppendMenuW(ovl, MF_STRING | allowed | chk(effPos == i), ID_POS_FIRST + i, posNames[i]);
+        radio(ovl, effPos == i, ID_POS_FIRST + i, posNames[i], allowed);
     }
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)ovl, L"On-screen indicator");
-
-    HMENU look = CreatePopupMenu();
-    static const wchar_t* styleNames[] = {L"Capsule", L"Orb", L"Edge", L"Chip", L"Corner"};
-    for (DWORD i = STYLE_CAPSULE; i <= STYLE_CORNER; i++)
-        AppendMenuW(look, MF_STRING | chk(g_cfg.overlayStyle == i), ID_STYLE_FIRST + i, styleNames[i]);
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)look, L"Indicator style");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)ovl, L"Indicator");
 
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | chk(g_cfg.sounds != 0), ID_SOUNDS, L"Play sounds");
@@ -1095,15 +1192,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     KillTimer(hwnd, TIMER_OVL_HOLD);
                     // After a flash, fall back to the steady badge if settings call for one.
                     if (WantsPersistentBadge()) ShowOverlay(g_muted);
-                    else SetTimer(hwnd, TIMER_OVL_FADE, 15, nullptr);
+                    else StartFade(0, kFadeOutMs);
                     break;
                 case TIMER_CAPTURE:
                     if (g_capturing) EndCapture(L"Hotkey unchanged: " + BindName());
                     break;
                 case TIMER_OVL_FADE:
-                    g_overlayAlpha -= 20;
-                    if (g_overlayAlpha <= 0) HideOverlay();
-                    else SetOverlayAlpha(g_overlayAlpha);
+                    StepFade();
                     break;
                 case TIMER_OVL_TOPMOST:
                     if (g_overlayVisible)
@@ -1111,9 +1206,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
             }
             return 0;
-        case WM_DISPLAYCHANGE:
-        case WM_SETTINGCHANGE:  // resolution / work area / DPI change: re-place the badge
-            if (g_overlayVisible && g_overlayAlpha == 255) PaintOverlay();
+        case WM_SETTINGCHANGE:
+            // Light/dark switch: menus are rebuilt on every open, so just drop the cached theme.
+            if (lp && lstrcmpiW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) ApplyMenuTheme();
+            [[fallthrough]];
+        case WM_DISPLAYCHANGE:  // resolution / work area / DPI change: re-place the badge
+            if (g_overlayVisible) PaintOverlay();
             return 0;
         case WM_DESTROY:
             if (g_cfg.mode == MODE_PTT) WriteMuted(false);  // don't leave the mic dead after exit
@@ -1173,6 +1271,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, kAppName, WS_POPUP, 0, 0, 0, 0,
                              nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) return 1;
+    InitDarkMenus(g_hwnd);
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     WNDCLASSEXW oc = {sizeof(oc)};

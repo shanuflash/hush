@@ -61,7 +61,17 @@ enum : DWORD { BIND_MOUSE = 0, BIND_KEY = 1 };
 enum : DWORD { SCOPE_ALL = 0, SCOPE_DEFAULT = 1 };
 enum : DWORD { OVL_OFF = 0, OVL_MUTED = 1, OVL_ALWAYS = 2, OVL_FLASH = 3, OVL_LIVE = 4 };
 enum : DWORD { POS_TL = 0, POS_TC, POS_TR, POS_BL, POS_BC, POS_BR };
-enum : DWORD { STYLE_CAPSULE = 0, STYLE_ORB, STYLE_EDGE, STYLE_CHIP, STYLE_CORNER };
+// 3 and 4 were Chip and Corner; they stay unused so old saved settings fall back to Capsule.
+enum : DWORD { STYLE_CAPSULE = 0, STYLE_ORB = 1, STYLE_EDGE = 2, STYLE_GHOST = 5, STYLE_GLOW = 6 };
+struct StyleInfo { DWORD id; const wchar_t* name; };
+static const StyleInfo kStyles[] = {
+    {STYLE_CAPSULE, L"Capsule"}, {STYLE_ORB, L"Orb"}, {STYLE_EDGE, L"Edge"}, {STYLE_GHOST, L"Ghost"}, {STYLE_GLOW, L"Glow"},
+};
+static bool IsStyle(DWORD v) {
+    for (auto& st : kStyles)
+        if (st.id == v) return true;
+    return false;
+}
 
 struct Settings {
     DWORD mode = MODE_TOGGLE;
@@ -95,7 +105,8 @@ static bool LoadSettings() {
     get(L"Sounds", g_cfg.sounds, 1);
     get(L"Overlay", g_cfg.overlay, OVL_LIVE);
     get(L"OverlayPos", g_cfg.overlayPos, POS_BR);
-    get(L"OverlayStyle", g_cfg.overlayStyle, STYLE_CORNER);
+    get(L"OverlayStyle", g_cfg.overlayStyle, STYLE_GLOW);
+    if (!IsStyle(g_cfg.overlayStyle)) g_cfg.overlayStyle = STYLE_CAPSULE;  // a removed style
     RegCloseKey(k);
     return true;
 }
@@ -350,6 +361,16 @@ static float SegDist(float px, float py, float ax, float ay, float bx, float by)
     return std::sqrt(ex * ex + ey * ey);
 }
 
+// The mic shape and its slash, in unit coordinates (0..1 across the glyph box).
+static bool MicAt(float u, float v) {
+    float da = std::sqrt((u - 0.5f) * (u - 0.5f) + (v - 0.47f) * (v - 0.47f));
+    return SegDist(u, v, 0.5f, 0.27f, 0.5f, 0.47f) <= 0.12f ||
+           (std::fabs(da - 0.205f) <= 0.04f && v >= 0.47f) ||
+           SegDist(u, v, 0.5f, 0.675f, 0.5f, 0.77f) <= 0.04f ||
+           SegDist(u, v, 0.39f, 0.77f, 0.61f, 0.77f) <= 0.04f;
+}
+static float SlashDist(float u, float v) { return SegDist(u, v, 0.24f, 0.22f, 0.76f, 0.80f); }
+
 // Coloured disc with a white mic (slashed when muted). ARGB, straight alpha.
 // none: no microphone present, drawn grey and slashed.
 static std::vector<uint32_t> RenderMicGlyph(bool muted, int size, bool none = false) {
@@ -367,14 +388,9 @@ static std::vector<uint32_t> RenderMicGlyph(bool muted, int size, bool none = fa
                     float dc = std::sqrt((u - 0.5f) * (u - 0.5f) + (v - 0.5f) * (v - 0.5f));
                     if (dc > 0.5f) continue;
                     uint32_t c = bg;
-                    float da = std::sqrt((u - 0.5f) * (u - 0.5f) + (v - 0.47f) * (v - 0.47f));
-                    bool mic = SegDist(u, v, 0.5f, 0.27f, 0.5f, 0.47f) <= 0.12f ||
-                               (std::fabs(da - 0.205f) <= 0.04f && v >= 0.47f) ||
-                               SegDist(u, v, 0.5f, 0.675f, 0.5f, 0.77f) <= 0.04f ||
-                               SegDist(u, v, 0.39f, 0.77f, 0.61f, 0.77f) <= 0.04f;
-                    if (mic) c = 0xFFFFFF;
+                    if (MicAt(u, v)) c = 0xFFFFFF;
                     if (muted) {
-                        float ds = SegDist(u, v, 0.24f, 0.22f, 0.76f, 0.80f);
+                        float ds = SlashDist(u, v);
                         if (ds <= 0.095f) c = bg;
                         if (ds <= 0.045f) c = 0xFFFFFF;
                     }
@@ -570,7 +586,7 @@ static Mask TextMask(const wchar_t* text, int px, int spacing) {
     return m;
 }
 
-// Dark translucent surface shared by Capsule and Tile: drop shadow, fill, hairline.
+// Dark translucent surface behind the Capsule: drop shadow, fill, hairline.
 static void PaintMaterial(Canvas& cv, float x, float y, float w, float h, float r, float s) {
     Mask shadow = MakeMask(cv.w, cv.h, [&](float px, float py) { return Coverage(SdRoundRect(px, py, x, y + 6 * s, w, h, r)); });
     Blur(shadow, 9 * s);
@@ -592,7 +608,7 @@ struct Badge {
 static int Px(float v, float s) { return (int)(v * s + 0.5f); }
 
 static Badge BuildCapsule(bool muted, bool none, const std::wstring& label, float s) {
-    const wchar_t* text = !label.empty() ? label.c_str() : muted ? L"MIC MUTED" : L"MIC LIVE";
+    const wchar_t* text = !label.empty() ? label.c_str() : muted ? L"MUTED" : L"LIVE";
     Mask t = TextMask(text, Px(13, s), 0);
     const int h = Px(30, s), g = Px(20, s), padL = Px(5, s), gap = Px(7, s), padR = Px(13, s), P = Px(28, s);
     const int w = padL + g + gap + t.w + padR;
@@ -617,82 +633,125 @@ static Badge BuildOrb(bool muted, float s) {
     return {std::move(cv), {P, P, P + d, P + d}};
 }
 
-static Badge BuildEdge(bool muted, bool bottom, float s) {
+static float EaseOut(float t) { t = Clamp01(t); return 1 - (1 - t) * (1 - t) * (1 - t); }
+
+static const UINT kEdgeAnimMs = 600;
+
+// anim: 0..1 through the state-change animation; 1 is the resting badge. The line
+// draws out from the centre, its bloom flares and settles, and the word fades in.
+static Badge BuildEdge(bool muted, bool bottom, float s, float anim = 1.f) {
     const uint32_t c = muted ? kRed : kGreen;
     const int W = Px(240, s), lh = Px(4, s), gap = Px(7, s), P = Px(20, s), spacing = Px(1.76f, s);
     Mask t = TextMask(muted ? L"MUTED" : L"LIVE", Px(11, s), spacing);
     const int bodyH = lh + gap + t.h;
     Canvas cv(W + 2 * P, bodyH + 2 * P);
+    const float ms = anim * kEdgeAnimMs;
+    const float draw = EaseOut(ms / 480), settle = EaseOut(ms / kEdgeAnimMs), word = EaseOut((ms - 120) / 340);
     const float lineY = (float)(bottom ? P + bodyH - lh : P);
-    const int textY = bottom ? P : P + lh + gap;
-    // Line fades out over its outer 22% on each side.
+    const int textY = (bottom ? P : P + lh + gap) - (int)std::lround(3 * s * (1 - word));
+    // Line fades out over its outer 22% on each side. Muted is dashed, so the state
+    // reads without relying on red versus green.
+    const float cx = P + W / 2.f, dash = 12 * s, period = 18 * s;
+    const float feather = 24 * s, reach = (W / 2.f + feather) * (0.12f + 0.88f * draw);
     Mask line = MakeMask(cv.w, cv.h, [&](float px, float py) {
         float u = (px - P) / W;
         float f = Clamp01(u < 0.22f ? u / 0.22f : u > 0.78f ? (1 - u) / 0.22f : 1.f);
-        return Coverage(SdRoundRect(px, py, (float)P, lineY, (float)W, (float)lh, lh / 2.f)) * f;
+        f *= Clamp01((reach - std::fabs(px - cx)) / feather);  // how far it has drawn out
+        if (!muted) return Coverage(SdRoundRect(px, py, (float)P, lineY, (float)W, (float)lh, lh / 2.f)) * f;
+        // Nearest dash, centred on the middle of the line, with rounded ends.
+        float dc = cx + std::round((px - cx) / period) * period;
+        return Coverage(SdRoundRect(px, py, dc - dash / 2, lineY, dash, (float)lh, lh / 2.f)) * f;
     });
     Mask glow = line;
-    Blur(glow, 7 * s);
-    cv.Fill(glow, 0, 0, c, 0.7f);
-    cv.Fill(line, 0, 0, c, 1.f);
+    Blur(glow, (12 - 5 * settle) * s);
+    cv.Fill(glow, 0, 0, c, 1 - 0.3f * settle);
+    cv.Fill(line, 0, 0, c, 0.3f + 0.7f * draw);
+    if (word <= 0) return {std::move(cv), {P, P, P + W, P + bodyH}};
 
     const int tx = P + (W - t.w + spacing) / 2;
+    // Soft dark halo so the white word survives bright scenes; invisible over dark ones.
+    // Blurred thin strokes spread very faint, so the halo is boosted back up after blurring.
+    Mask halo = Placed(t, cv.w, cv.h, tx, textY);
+    Blur(halo, 2.5f * s);
+    for (float& v : halo.a) v = std::min(1.f, v * 3.f);
+    cv.Fill(halo, 0, 0, 0x000000, 0.55f * word);
     Mask shade = Placed(t, cv.w, cv.h, tx, textY + Px(1, s));
     Blur(shade, 1 * s);
-    cv.Fill(shade, 0, 0, 0x000000, 0.7f);
+    cv.Fill(shade, 0, 0, 0x000000, 0.7f * word);
     Mask tglow = Placed(t, cv.w, cv.h, tx, textY);
     Blur(tglow, 4 * s);
-    cv.Fill(tglow, 0, 0, c, 0.7f);
-    cv.Fill(t, tx, textY, 0xFFFFFF, 1.f);
+    cv.Fill(tglow, 0, 0, c, 0.7f * word);
+    cv.Fill(t, tx, textY, 0xFFFFFF, word);
     return {std::move(cv), {P, P, P + W, P + bodyH}};
 }
 
-// Compact Capsule: glowing dot and one word.
-static Badge BuildChip(bool muted, float s) {
-    const uint32_t c = muted ? kRed : kGreen;
-    const int spacing = Px(1.32f, s);
-    Mask t = TextMask(muted ? L"MUTED" : L"LIVE", Px(11, s), spacing);
-    const int h = Px(24, s), dot = Px(7, s), padL = Px(9, s), gap = Px(7, s), padR = Px(11, s), P = Px(28, s);
-    const int w = padL + dot + gap + t.w - spacing + padR;  // GDI adds spacing after the last letter too
-    Canvas cv(w + 2 * P, h + 2 * P);
-    PaintMaterial(cv, (float)P, (float)P, (float)w, (float)h, h / 2.f, s);
-    const float cx = P + padL + dot / 2.f, cy = P + h / 2.f;
-    Mask led = MakeMask(cv.w, cv.h, [&](float px, float py) { return Coverage(std::hypot(px - cx, py - cy) - dot / 2.f); });
-    Mask glow = led;
-    Blur(glow, 3.5f * s);
-    cv.Fill(glow, 0, 0, c, 0.8f);
-    cv.Fill(led, 0, 0, c, 1.f);
-    cv.Fill(t, P + padL + dot + gap, P + (h - t.h) / 2, 0xFFFFFF, 1.f);
-    return {std::move(cv), {P, P, P + w, P + h}};
+// Coverage of a unit-coordinate shape in a size x size box, 4x4 supersampled.
+template <class F>
+static Mask GlyphMask(int size, F inside) {
+    Mask m(size, size);
+    const int ss = 4;
+    for (int y = 0; y < size; y++)
+        for (int x = 0; x < size; x++) {
+            int hits = 0;
+            for (int sy = 0; sy < ss; sy++)
+                for (int sx = 0; sx < ss; sx++)
+                    hits += inside((x + (sx + 0.5f) / ss) / size, (y + (sy + 0.5f) / ss) / size);
+            m.a[(size_t)y * size + x] = hits / float(ss * ss);
+        }
+    return m;
 }
 
-static Badge BuildCorner(bool muted, DWORD pos, float s) {
+// Ghost: the mic on its own, white with a coloured glow. Muted cuts a red slash through it.
+static Badge BuildGhost(bool muted, float s) {
     const uint32_t c = muted ? kRed : kGreen;
-    const int L = Px(56, s), t = Px(4, s), P = Px(18, s);
-    const bool top = pos <= POS_TR, left = pos == POS_TL || pos == POS_BL;
-    Canvas cv(L + 2 * P, L + 2 * P);
-    const float x0 = (float)P, y0 = (float)P;
-    const float hy = top ? y0 : y0 + L - t, vx = left ? x0 : x0 + L - t;
-    // Both arms are brightest at the screen corner and fade toward their ends.
-    Mask bars = MakeMask(cv.w, cv.h, [&](float px, float py) {
-        float fh = Clamp01(left ? 1 - (px - x0) / L : (px - x0) / L);
-        float fv = Clamp01(top ? 1 - (py - y0) / L : (py - y0) / L);
-        float hc = Coverage(SdRoundRect(px, py, x0, hy, (float)L, (float)t, t / 2.f)) * fh;
-        float vc = Coverage(SdRoundRect(px, py, vx, y0, (float)t, (float)L, t / 2.f)) * fv;
-        return std::max(hc, vc);
-    });
-    Mask glow = bars;
+    const int g = Px(36, s), P = Px(16, s);
+    Canvas cv(g + 2 * P, g + 2 * P);
+    Mask mic = Placed(GlyphMask(g, [&](float u, float v) { return MicAt(u, v) && !(muted && SlashDist(u, v) <= 0.095f); }),
+                      cv.w, cv.h, P, P);
+    Mask slash = Placed(GlyphMask(g, [&](float u, float v) { return muted && SlashDist(u, v) <= 0.045f; }), cv.w, cv.h, P, P);
+    Mask shape = mic;
+    for (size_t i = 0; i < shape.a.size(); i++) shape.a[i] = std::max(shape.a[i], slash.a[i]);
+    Mask glow = shape;
     Blur(glow, 6 * s);
-    cv.Fill(glow, 0, 0, c, 0.65f);
-    cv.Fill(bars, 0, 0, c, 1.f);
-    return {std::move(cv), {P, P, P + L, P + L}};
+    for (float& v : glow.a) v = std::min(1.f, v * 2.f);  // thin strokes blur faint; bring the glow back up
+    cv.Fill(glow, 0, 0, c, 0.85f);
+    Mask shade = Placed(shape, cv.w, cv.h, 0, Px(1, s));
+    Blur(shade, 2 * s);
+    cv.Fill(shade, 0, 0, 0x000000, 0.6f);
+    cv.Fill(mic, 0, 0, 0xFFFFFF, 1.f);
+    cv.Fill(slash, 0, 0, c, 1.f);
+    return {std::move(cv), {P, P, P + g, P + g}};
 }
 
-// Edge only sits at a center position, Corner only in a corner.
+// Glow: coloured light pouring in from the screen corner. No shape, no text.
+static Badge BuildGlow(bool muted, DWORD pos, float s) {
+    const uint32_t c = muted ? kRed : kGreen;
+    const int R = Px(220, s);
+    Canvas cv(R, R);
+    const float ox = (pos == POS_TL || pos == POS_BL) ? 0.f : (float)R, oy = pos <= POS_TR ? 0.f : (float)R;
+    // Main pool: strong at the corner and holding its colour well out, easing to nothing by
+    // the box's edges so it never clips.
+    Mask light = MakeMask(R, R, [&](float px, float py) {
+        float t = Clamp01(std::hypot(px - ox, py - oy) / R);
+        return std::pow(1 - t, 1.4f);
+    });
+    cv.Fill(light, 0, 0, c, 0.9f);
+    // A small, lighter hot spot right in the corner, so it reads as a light source.
+    const float core = 0.22f * R;
+    Mask hot = MakeMask(R, R, [&](float px, float py) {
+        float t = Clamp01(std::hypot(px - ox, py - oy) / core);
+        return (1 - t) * (1 - t);
+    });
+    auto mix = [&](int shift) { return (uint32_t)((((c >> shift) & 0xFF) * 65 + 255 * 35) / 100) << shift; };
+    cv.Fill(hot, 0, 0, mix(16) | mix(8) | mix(0), 0.6f);
+    return {std::move(cv), {0, 0, R, R}};
+}
+
+// Edge only sits at a center position, Glow only in a corner.
 static DWORD EffectivePos(DWORD style, DWORD pos) {
     const bool top = pos <= POS_TR;
     if (style == STYLE_EDGE) return top ? POS_TC : POS_BC;
-    if (style == STYLE_CORNER && (pos == POS_TC || pos == POS_BC)) return top ? POS_TR : POS_BR;
+    if (style == STYLE_GLOW && (pos == POS_TC || pos == POS_BC)) return top ? POS_TR : POS_BR;
     return pos;
 }
 
@@ -700,7 +759,7 @@ static DWORD EffectivePos(DWORD style, DWORD pos) {
 // Overlay window: layered, click-through, never activated, hidden from capture
 // ---------------------------------------------------------------------------
 
-enum : UINT_PTR { TIMER_OVL_HOLD = 1, TIMER_OVL_FADE = 2, TIMER_OVL_TOPMOST = 3, TIMER_CAPTURE = 4 };
+enum : UINT_PTR { TIMER_OVL_HOLD = 1, TIMER_OVL_FADE = 2, TIMER_OVL_TOPMOST = 3, TIMER_CAPTURE = 4, TIMER_OVL_ANIM = 5 };
 
 // Last known mic state. While no microphone is present g_noMic is set and g_muted
 // keeps its old value, so a mic that comes back is put back the way it was.
@@ -714,6 +773,8 @@ static int g_fadeFrom, g_fadeTo;  // alpha animation, driven by TIMER_OVL_FADE
 static ULONGLONG g_fadeStart;
 static UINT g_fadeMs;
 static std::wstring g_overlayLabel;  // non-empty: a text prompt, always drawn as a Capsule
+static float g_edgeAnim = 1.f;       // Edge's change animation, 0..1, driven by TIMER_OVL_ANIM
+static ULONGLONG g_edgeAnimStart;
 
 static void PaintOverlay() {
     HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
@@ -726,15 +787,15 @@ static void PaintOverlay() {
     const DWORD style = g_overlayLabel.empty() ? g_cfg.overlayStyle : STYLE_CAPSULE;
     const DWORD pos = EffectivePos(style, g_cfg.overlayPos);
     const bool muted = g_overlayMuted;
-    Badge b = style == STYLE_ORB    ? BuildOrb(muted, s)
-            : style == STYLE_EDGE   ? BuildEdge(muted, pos >= POS_BL, s)
-            : style == STYLE_CHIP   ? BuildChip(muted, s)
-            : style == STYLE_CORNER ? BuildCorner(muted, pos, s)
-                                    : BuildCapsule(muted, g_overlayNone, g_overlayLabel, s);
+    Badge b = style == STYLE_ORB   ? BuildOrb(muted, s)
+            : style == STYLE_EDGE  ? BuildEdge(muted, pos >= POS_BL, s, g_edgeAnim)
+            : style == STYLE_GHOST ? BuildGhost(muted, s)
+            : style == STYLE_GLOW  ? BuildGlow(muted, pos, s)
+                                   : BuildCapsule(muted, g_overlayNone, g_overlayLabel, s);
 
-    // Place the visible shape; Edge and Corner sit flush against the screen edge.
+    // Place the visible shape; Edge and Glow sit flush against the screen edge.
     const int bw = b.body.right - b.body.left, bh = b.body.bottom - b.body.top;
-    const int margin = (style == STYLE_EDGE || style == STYLE_CORNER) ? 0 : Px(16, s);
+    const int margin = (style == STYLE_EDGE || style == STYLE_GLOW) ? 0 : Px(16, s);
     const RECT& rc = mi.rcWork;
     int sx = (pos == POS_TL || pos == POS_BL) ? rc.left + margin
            : (pos == POS_TC || pos == POS_BC) ? (rc.left + rc.right - bw) / 2
@@ -788,9 +849,18 @@ static void HideOverlay() {
     KillTimer(g_hwnd, TIMER_OVL_HOLD);
     KillTimer(g_hwnd, TIMER_OVL_FADE);
     KillTimer(g_hwnd, TIMER_OVL_TOPMOST);
+    KillTimer(g_hwnd, TIMER_OVL_ANIM);
     ShowWindow(g_overlay, SW_HIDE);
     g_overlayVisible = false;
     g_overlayAlpha = 0;
+    g_edgeAnim = 1.f;
+}
+
+// Honours "Animation effects" in Windows settings.
+static bool AnimationsEnabled() {
+    BOOL on = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &on, 0);
+    return on != FALSE;
 }
 
 // Fade in eases out (fast start, soft landing); fade out eases in and out.
@@ -809,6 +879,16 @@ static void StepFade() {
 static void ShowOverlay(bool muted, const std::wstring& label = L"") {
     KillTimer(g_hwnd, TIMER_OVL_HOLD);
     KillTimer(g_hwnd, TIMER_OVL_FADE);
+    // Edge plays its draw-out whenever what it shows changes; a repaint of the same state doesn't.
+    const bool changed = !g_overlayVisible || muted != g_overlayMuted || g_noMic != g_overlayNone || !g_overlayLabel.empty();
+    if (label.empty() && g_cfg.overlayStyle == STYLE_EDGE && changed && AnimationsEnabled()) {
+        g_edgeAnim = 0.f;
+        g_edgeAnimStart = GetTickCount64();
+        SetTimer(g_hwnd, TIMER_OVL_ANIM, 10, nullptr);
+    } else if (!label.empty()) {
+        KillTimer(g_hwnd, TIMER_OVL_ANIM);
+        g_edgeAnim = 1.f;
+    }
     g_overlayMuted = muted;
     g_overlayNone = g_noMic;
     g_overlayLabel = label;
@@ -1157,9 +1237,8 @@ static void ShowMenu(int x, int y) {
     radio(ovl, g_cfg.overlay == OVL_LIVE, ID_OVL_LIVE, L"Only while live");
     radio(ovl, g_cfg.overlay == OVL_ALWAYS, ID_OVL_ALWAYS, L"Always");
     AppendMenuW(ovl, MF_SEPARATOR, 0, nullptr);
-    static const wchar_t* styleNames[] = {L"Capsule", L"Orb", L"Edge", L"Chip", L"Corner"};
-    for (DWORD i = STYLE_CAPSULE; i <= STYLE_CORNER; i++)
-        radio(ovl, g_cfg.overlayStyle == i, ID_STYLE_FIRST + i, styleNames[i]);
+    for (auto& st : kStyles)
+        radio(ovl, g_cfg.overlayStyle == st.id, ID_STYLE_FIRST + st.id, st.name);
     AppendMenuW(ovl, MF_SEPARATOR, 0, nullptr);
     static const wchar_t* posNames[] = {L"Top left", L"Top center", L"Top right",
                                         L"Bottom left", L"Bottom center", L"Bottom right"};
@@ -1187,7 +1266,7 @@ static void ShowMenu(int x, int y) {
         FlashOverlay(g_muted, 1500);  // preview the new position
         return;
     }
-    if (cmd >= ID_STYLE_FIRST && cmd <= ID_STYLE_FIRST + STYLE_CORNER) {
+    if (cmd >= ID_STYLE_FIRST && cmd < ID_EXIT && IsStyle(cmd - ID_STYLE_FIRST)) {
         g_cfg.overlayStyle = cmd - ID_STYLE_FIRST;
         SaveSettings();
         FlashOverlay(g_muted, 1500);  // preview the new style
@@ -1257,6 +1336,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 case TIMER_OVL_FADE:
                     StepFade();
+                    break;
+                case TIMER_OVL_ANIM:
+                    g_edgeAnim = std::min(1.f, (float)(GetTickCount64() - g_edgeAnimStart) / kEdgeAnimMs);
+                    if (g_edgeAnim >= 1) KillTimer(hwnd, TIMER_OVL_ANIM);
+                    if (g_overlayVisible) PaintOverlay();
                     break;
                 case TIMER_OVL_TOPMOST:
                     if (g_overlayVisible)

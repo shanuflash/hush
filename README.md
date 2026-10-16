@@ -26,6 +26,8 @@ Right-click the tray icon.
 
 ## Notes
 
+- If a game runs as administrator, Windows won't pass its input to Hush while it has focus, so the hotkey does nothing in that game. Run Hush as administrator too (right-click → Run as administrator), or don't run the game elevated.
+- Exiting Hush unmutes your mic if Hush was the one that muted it, so it's never left dead with no tray icon to explain why.
 - If you used a Discord mute keybind on the same button, remove it. Otherwise both fire and you end up double muted.
 - Discord won't show its red mute icon since the mute happens at the Windows level. People just hear nothing.
 - The on-screen badge doesn't show up in exclusive fullscreen. Borderless and windowed are fine.

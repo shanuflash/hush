@@ -67,7 +67,7 @@ struct Settings {
     DWORD mode = MODE_TOGGLE;
     DWORD bindKind = BIND_MOUSE;
     DWORD bindCode = 4;   // mouse: 3=middle 4=back 5=forward, key: virtual-key code
-    DWORD bindScan = 0;   // key only: scan code | (extended << 8), for display
+    DWORD bindScan = 0;   // key only: scan code | E0 << 8 | E1 << 9; 0 = match by bindCode
     DWORD scope = SCOPE_ALL;
     DWORD sounds = 1;
     DWORD overlay = OVL_FLASH;
@@ -90,7 +90,7 @@ static bool LoadSettings() {
     get(L"Mode", g_cfg.mode, MODE_PTM);
     get(L"BindKind", g_cfg.bindKind, BIND_KEY);
     get(L"BindCode", g_cfg.bindCode, 0xFF);
-    get(L"BindScan", g_cfg.bindScan, 0x1FF);
+    get(L"BindScan", g_cfg.bindScan, 0x3FF);
     get(L"Scope", g_cfg.scope, SCOPE_DEFAULT);
     get(L"Sounds", g_cfg.sounds, 1);
     get(L"Overlay", g_cfg.overlay, OVL_LIVE);
@@ -162,6 +162,7 @@ static std::wstring BindName() {
     }
     LONG lp = (LONG)((g_cfg.bindScan & 0xFF) << 16);
     if (g_cfg.bindScan & 0x100) lp |= 1 << 24;
+    if (g_cfg.bindScan & 0x200) lp = 0x45 << 16;  // Pause arrives as E1 1D; its name lives at 45
     wchar_t name[64] = {};
     if (GetKeyNameTextW(lp, name, 64) > 0) return name;
     wchar_t buf[32];
@@ -216,14 +217,16 @@ static void CollectEndpoints(std::vector<ComPtr<IAudioEndpointVolume>>& out) {
     }
 }
 
-// Muted only if every targeted endpoint is muted.
-static bool QueryMuted() {
+// Muted only if every targeted endpoint is muted. Returns false, leaving `muted`
+// alone, when there is no microphone to ask.
+static bool ReadMuted(bool& muted) {
     std::vector<ComPtr<IAudioEndpointVolume>> eps;
     CollectEndpoints(eps);
     if (eps.empty()) return false;
+    muted = true;
     for (auto& v : eps) {
         BOOL m = FALSE;
-        if (SUCCEEDED(v->GetMute(&m)) && !m) return false;
+        if (SUCCEEDED(v->GetMute(&m)) && !m) { muted = false; break; }
     }
     return true;
 }
@@ -336,7 +339,7 @@ static void PlayFeedback(bool muted) {
 // Mic glyph (drawn procedurally, 4x4 supersampled)
 // ---------------------------------------------------------------------------
 
-static const uint32_t kRed = 0xF23F43, kGreen = 0x23A55A;
+static const uint32_t kRed = 0xF23F43, kGreen = 0x23A55A, kGrey = 0x80848E;
 
 static float SegDist(float px, float py, float ax, float ay, float bx, float by) {
     float dx = bx - ax, dy = by - ay;
@@ -348,8 +351,10 @@ static float SegDist(float px, float py, float ax, float ay, float bx, float by)
 }
 
 // Coloured disc with a white mic (slashed when muted). ARGB, straight alpha.
-static std::vector<uint32_t> RenderMicGlyph(bool muted, int size) {
-    const uint32_t bg = muted ? kRed : kGreen;
+// none: no microphone present, drawn grey and slashed.
+static std::vector<uint32_t> RenderMicGlyph(bool muted, int size, bool none = false) {
+    const uint32_t bg = none ? kGrey : muted ? kRed : kGreen;
+    muted = muted || none;
     std::vector<uint32_t> px(size * size);
     const int ss = 4;
     for (int y = 0; y < size; y++) {
@@ -397,8 +402,8 @@ static HBITMAP CreateDib32(HDC dc, int w, int h, void** bits) {
     return CreateDIBSection(dc, &bi, DIB_RGB_COLORS, bits, nullptr, 0);
 }
 
-static HICON MakeTrayIcon(bool muted, int size) {
-    std::vector<uint32_t> px = RenderMicGlyph(muted, size);
+static HICON MakeTrayIcon(bool muted, int size, bool none = false) {
+    std::vector<uint32_t> px = RenderMicGlyph(muted, size, none);
     void* bits = nullptr;
     HBITMAP color = CreateDib32(nullptr, size, size, &bits);
     if (!color) return nullptr;
@@ -586,14 +591,14 @@ struct Badge {
 
 static int Px(float v, float s) { return (int)(v * s + 0.5f); }
 
-static Badge BuildCapsule(bool muted, const std::wstring& label, float s) {
+static Badge BuildCapsule(bool muted, bool none, const std::wstring& label, float s) {
     const wchar_t* text = !label.empty() ? label.c_str() : muted ? L"MIC MUTED" : L"MIC LIVE";
     Mask t = TextMask(text, Px(13, s), 0);
     const int h = Px(30, s), g = Px(20, s), padL = Px(5, s), gap = Px(7, s), padR = Px(13, s), P = Px(28, s);
     const int w = padL + g + gap + t.w + padR;
     Canvas cv(w + 2 * P, h + 2 * P);
     PaintMaterial(cv, (float)P, (float)P, (float)w, (float)h, h / 2.f, s);
-    cv.Image(RenderMicGlyph(muted, g), g, P + padL, P + (h - g) / 2);
+    cv.Image(RenderMicGlyph(muted, g, none), g, P + padL, P + (h - g) / 2);
     cv.Fill(t, P + padL + g + gap, P + (h - t.h) / 2, 0xFFFFFF, 1.f);
     return {std::move(cv), {P, P, P + w, P + h}};
 }
@@ -697,10 +702,14 @@ static DWORD EffectivePos(DWORD style, DWORD pos) {
 
 enum : UINT_PTR { TIMER_OVL_HOLD = 1, TIMER_OVL_FADE = 2, TIMER_OVL_TOPMOST = 3, TIMER_CAPTURE = 4 };
 
+// Last known mic state. While no microphone is present g_noMic is set and g_muted
+// keeps its old value, so a mic that comes back is put back the way it was.
+static bool g_muted, g_noMic;
+
 static HWND g_overlay;
 static bool g_overlayVisible;
 static int g_overlayAlpha;
-static bool g_overlayMuted;
+static bool g_overlayMuted, g_overlayNone;
 static int g_fadeFrom, g_fadeTo;  // alpha animation, driven by TIMER_OVL_FADE
 static ULONGLONG g_fadeStart;
 static UINT g_fadeMs;
@@ -721,7 +730,7 @@ static void PaintOverlay() {
             : style == STYLE_EDGE   ? BuildEdge(muted, pos >= POS_BL, s)
             : style == STYLE_CHIP   ? BuildChip(muted, s)
             : style == STYLE_CORNER ? BuildCorner(muted, pos, s)
-                                    : BuildCapsule(muted, g_overlayLabel, s);
+                                    : BuildCapsule(muted, g_overlayNone, g_overlayLabel, s);
 
     // Place the visible shape; Edge and Corner sit flush against the screen edge.
     const int bw = b.body.right - b.body.left, bh = b.body.bottom - b.body.top;
@@ -801,6 +810,7 @@ static void ShowOverlay(bool muted, const std::wstring& label = L"") {
     KillTimer(g_hwnd, TIMER_OVL_HOLD);
     KillTimer(g_hwnd, TIMER_OVL_FADE);
     g_overlayMuted = muted;
+    g_overlayNone = g_noMic;
     g_overlayLabel = label;
     if (!g_overlayVisible) g_overlayAlpha = 0;  // appear from nothing; a mid-fade badge picks up where it is
     PaintOverlay();
@@ -817,18 +827,25 @@ static void FlashOverlay(bool muted, UINT holdMs, const std::wstring& label = L"
     SetTimer(g_hwnd, TIMER_OVL_HOLD, holdMs, nullptr);
 }
 
-static bool g_muted;
 static bool g_capturing;  // waiting for a new hotkey
 
 // Whether the current settings keep a badge on screen once any flash is over.
 static bool WantsPersistentBadge() {
+    if (g_noMic) return false;
     return g_cfg.overlay == OVL_ALWAYS || (g_cfg.overlay == OVL_MUTED && g_muted) ||
            (g_cfg.overlay == OVL_LIVE && !g_muted);
 }
 
-// changed: the mute state just flipped, so transient badges should flash.
+// changed: the mic state just changed (or the hotkey was pressed with no mic),
+// so transient badges should flash.
 static void UpdateOverlay(bool changed) {
     if (g_capturing) return;  // keep the "press new hotkey" prompt up
+    if (g_noMic) {
+        // Never claim LIVE or MUTED for a mic that isn't there.
+        if (changed && g_cfg.overlay != OVL_OFF) FlashOverlay(false, 1500, L"No microphone");
+        else if (!changed) HideOverlay();
+        return;
+    }
     switch (g_cfg.overlay) {
         case OVL_ALWAYS: ShowOverlay(g_muted); return;
         case OVL_MUTED:
@@ -862,7 +879,7 @@ enum : UINT {
     ID_EXIT = 99,
 };
 
-static HICON g_iconLive, g_iconMuted;
+static HICON g_iconLive, g_iconMuted, g_iconNone;
 static NOTIFYICONDATAW g_nid;
 static UINT g_msgTaskbarCreated;
 static bool g_pressed;     // bound button currently held
@@ -889,10 +906,10 @@ static void RegisterForBinding() {
 
 static void UpdateTray(DWORD msg = NIM_MODIFY) {
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
-    g_nid.hIcon = g_muted ? g_iconMuted : g_iconLive;
+    g_nid.hIcon = g_noMic ? g_iconNone : g_muted ? g_iconMuted : g_iconLive;
     static const wchar_t* modeNames[] = {L"toggle", L"push-to-talk", L"push-to-mute"};
-    std::wstring tip = std::wstring(L"Mic ") + (g_muted ? L"MUTED" : L"LIVE") + L"\n" + BindName() + L" → " +
-                       modeNames[g_cfg.mode];
+    std::wstring tip = std::wstring(g_noMic ? L"No microphone" : g_muted ? L"Mic MUTED" : L"Mic LIVE") + L"\n" +
+                       BindName() + L" → " + modeNames[g_cfg.mode];
     lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
     Shell_NotifyIconW(msg, &g_nid);
 }
@@ -917,30 +934,57 @@ static void Notify(const wchar_t* title, const std::wstring& text) {
     Shell_NotifyIconW(NIM_MODIFY, &n);
 }
 
-// Re-read the real mute state (it may have been changed by Windows or another app).
-static void RefreshState() {
-    bool m = QueryMuted();
-    if (m == g_muted) return;
+// The current mute was applied by Hush, so Hush lifts it again on exit. Cleared
+// when the mic is unmuted, or muted by Windows or another app.
+static bool g_muteOwned;
+
+// Re-read the endpoints into g_muted / g_noMic. Returns whether muted/live flipped.
+static bool ReadState() {
+    bool m = g_muted;
+    g_noMic = !ReadMuted(m);
+    bool flipped = m != g_muted;
     g_muted = m;
-    UpdateTray();
-    UpdateOverlay(true);
+    return flipped;
 }
 
-static void SetMute(bool mute) {
+// Re-read the real state (it may have been changed by Windows or another app, or
+// the mic may have come or gone). Returns whether muted/live flipped.
+static bool RefreshState() {
+    bool wasNone = g_noMic;
+    bool flipped = ReadState();
+    if (flipped || wasNone != g_noMic) {
+        UpdateTray();
+        UpdateOverlay(true);
+    }
+    return flipped;
+}
+
+static void SetMute(bool mute, bool feedback = true) {
     WriteMuted(mute);
-    bool was = g_muted;
-    g_muted = QueryMuted();
+    bool wasNone = g_noMic;
+    bool flipped = ReadState();
+    if (!g_noMic) g_muteOwned = g_muted;
     if (g_log) {
         std::vector<ComPtr<IAudioEndpointVolume>> eps;
         CollectEndpoints(eps);
         Log(L"SetMute(%d): %zu endpoint(s), now muted=%d", mute, eps.size(), g_muted);
     }
     UpdateTray();
-    UpdateOverlay(was != g_muted);
-    PlayFeedback(g_muted);
+    UpdateOverlay(flipped || g_noMic || wasNone);  // with no mic, every press says so
+    if (flipped && feedback) PlayFeedback(g_muted);
 }
 
-static void ToggleMute() { SetMute(!QueryMuted()); }
+static void ToggleMute() {
+    bool m = g_muted;
+    ReadMuted(m);  // the cached state can lag an outside change by a message
+    SetMute(!m);
+}
+
+// Undo a mute Hush applied, so the mic isn't left dead with nothing on screen to say so.
+static void ReleaseMute() {
+    if (g_muteOwned && g_muted && !g_noMic) WriteMuted(false);
+    g_muteOwned = false;
+}
 
 static void OnBindEvent(bool down) {
     if (down == g_pressed) return;  // ignore key auto-repeat and stray ups
@@ -1000,9 +1044,17 @@ static void OnRawInput(HRAWINPUT h) {
     } else if (ri.header.dwType == RIM_TYPEKEYBOARD) {
         const RAWKEYBOARD& k = ri.data.keyboard;
         if (k.VKey == 0xFF || k.VKey == 0) return;  // fake keys from escape sequences
+        // VKey can't tell left/right Ctrl, Shift and Alt apart, or Enter from numpad
+        // Enter, so match on the physical key. Bindings saved without a scan code,
+        // or keys injected with none, fall back to the virtual key.
+        const DWORD scan = k.MakeCode ? (k.MakeCode & 0xFF) | ((k.Flags & RI_KEY_E0) ? 0x100 : 0) |
+                                            ((k.Flags & RI_KEY_E1) ? 0x200 : 0)
+                                      : 0;
+        const bool isBound = g_cfg.bindKind == BIND_KEY &&
+                             (g_cfg.bindScan && scan ? scan == g_cfg.bindScan : k.VKey == g_cfg.bindCode);
         // Never log ordinary typing: only the bound key, or the key chosen while capturing.
-        if (g_capturing || (g_cfg.bindKind == BIND_KEY && k.VKey == g_cfg.bindCode))
-            Log(L"key vk=0x%02X flags=0x%X capturing=%d", k.VKey, k.Flags, g_capturing);
+        if (g_capturing || isBound)
+            Log(L"key vk=0x%02X scan=0x%03lX flags=0x%X capturing=%d", k.VKey, scan, k.Flags, g_capturing);
         bool down = !(k.Flags & RI_KEY_BREAK);
         if (g_capturing) {
             if (!down) return;
@@ -1010,10 +1062,10 @@ static void OnRawInput(HRAWINPUT h) {
                 EndCapture(L"Hotkey unchanged: " + BindName());
                 return;
             }
-            FinishCapture(BIND_KEY, k.VKey, (k.MakeCode & 0xFF) | ((k.Flags & RI_KEY_E0) ? 0x100 : 0));
+            FinishCapture(BIND_KEY, k.VKey, scan);
             return;
         }
-        if (g_cfg.bindKind == BIND_KEY && k.VKey == g_cfg.bindCode) OnBindEvent(down);
+        if (isBound) OnBindEvent(down);
     }
 }
 
@@ -1069,7 +1121,7 @@ static void InitDarkMenus(HWND owner) {
 }
 
 static void ShowMenu(int x, int y) {
-    RefreshState();
+    if (RefreshState()) g_muteOwned = false;  // changed outside Hush before its notification arrived
     HMENU m = CreatePopupMenu();
     HMENU mode = CreatePopupMenu();
     HMENU scope = CreatePopupMenu();
@@ -1080,8 +1132,9 @@ static void ShowMenu(int x, int y) {
         AppendMenuW(menu, MF_STRING | MFT_RADIOCHECK | chk(on) | extra, id, text);
     };
 
-    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, g_muted ? L"Microphone: MUTED" : L"Microphone: LIVE");
-    AppendMenuW(m, MF_STRING, ID_TOGGLE, g_muted ? L"Unmute" : L"Mute");
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0,
+                g_noMic ? L"Microphone: none found" : g_muted ? L"Microphone: MUTED" : L"Microphone: LIVE");
+    AppendMenuW(m, MF_STRING | (g_noMic ? MF_GRAYED : 0), ID_TOGGLE, g_muted ? L"Unmute" : L"Mute");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 
     std::wstring hk = L"Hotkey: " + BindName();
@@ -1176,13 +1229,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_APP_REFRESH:
             g_refreshPending = false;
-            RefreshState();
+            if (RefreshState()) g_muteOwned = false;  // someone else changed it; it's theirs now
             return 0;
         case WM_APP_DEVICES: {
             g_devicesPending = false;
-            bool wasMuted = g_muted;
+            // A newly connected mic shouldn't be live while Hush says "muted", or while
+            // push-to-talk isn't held.
+            bool want = g_cfg.mode == MODE_PTT ? !g_pressed : g_cfg.mode == MODE_PTM ? g_pressed : g_muted;
             WatchEndpoints();
-            if (wasMuted) WriteMuted(true);  // a newly connected mic shouldn't be live while "muted"
+            if (want) {
+                WriteMuted(true);
+                g_muteOwned = g_muteOwned || g_cfg.mode != MODE_TOGGLE;
+            }
             RefreshState();
             return 0;
         }
@@ -1213,8 +1271,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DISPLAYCHANGE:  // resolution / work area / DPI change: re-place the badge
             if (g_overlayVisible) PaintOverlay();
             return 0;
+        case WM_ENDSESSION:
+            // Logoff/shutdown skips WM_DESTROY. If Hush comes back at login it shows the
+            // mute itself; otherwise lift it so the mic isn't silently dead next session.
+            if (wp && !AutostartEnabled()) ReleaseMute();
+            return 0;
         case WM_DESTROY:
-            if (g_cfg.mode == MODE_PTT) WriteMuted(false);  // don't leave the mic dead after exit
+            ReleaseMute();
             if (g_devices) g_devices->UnregisterEndpointNotificationCallback(&g_deviceWatcher);
             UnwatchEndpoints();
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -1261,6 +1324,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     int iconSize = GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem());
     g_iconLive = MakeTrayIcon(false, iconSize);
     g_iconMuted = MakeTrayIcon(true, iconSize);
+    g_iconNone = MakeTrayIcon(false, iconSize, true);
 
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = WndProc;
@@ -1288,10 +1352,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     WatchEndpoints();
     if (g_devices) g_devices->RegisterEndpointNotificationCallback(&g_deviceWatcher);
 
-    g_muted = QueryMuted();
+    ReadState();
     AddTray();
     RegisterForBinding();
-    if (g_cfg.mode == MODE_PTT) SetMute(true);
+    if (g_cfg.mode == MODE_PTT) SetMute(true, false);  // quietly: no chirp at every login
     else UpdateOverlay(false);
     if (firstRun)
         Notify(L"Hush is running", BindName() + L" toggles your microphone. Right-click the tray icon for options.");

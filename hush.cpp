@@ -165,26 +165,44 @@ static void SaveSettings() {
     RegCloseKey(k);
 }
 
+// Explorer only launches a Run entry that also has a StartupApproved value (Task Manager's
+// Startup apps toggle). First byte even = enabled (02), odd = disabled by the user (03); the
+// rest is a timestamp, zero is fine.
+static const wchar_t* kApprovedKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+
 static bool AutostartEnabled() {
     HKEY k;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_READ, &k) != ERROR_SUCCESS) return false;
     bool on = RegQueryValueExW(k, kAppName, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
     RegCloseKey(k);
+    if (on && RegOpenKeyExW(HKEY_CURRENT_USER, kApprovedKey, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+        BYTE v[12];
+        DWORD size = sizeof(v);
+        if (RegQueryValueExW(k, kAppName, nullptr, nullptr, v, &size) == ERROR_SUCCESS && size && (v[0] & 1)) on = false;
+        RegCloseKey(k);
+    }
     return on;
 }
 
 static void SetAutostart(bool on) {
-    HKEY k;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
+    HKEY run, ok;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &run, nullptr) != ERROR_SUCCESS)
+        return;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kApprovedKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &ok, nullptr) != ERROR_SUCCESS)
+        ok = nullptr;
     if (on) {
         wchar_t path[MAX_PATH];
         GetModuleFileNameW(nullptr, path, MAX_PATH);
         std::wstring cmd = L"\"" + std::wstring(path) + L"\"";
-        RegSetValueExW(k, kAppName, 0, REG_SZ, (const BYTE*)cmd.c_str(), (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
+        RegSetValueExW(run, kAppName, 0, REG_SZ, (const BYTE*)cmd.c_str(), (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
+        static const BYTE approved[12] = {2};
+        if (ok) RegSetValueExW(ok, kAppName, 0, REG_BINARY, approved, sizeof(approved));
     } else {
-        RegDeleteValueW(k, kAppName);
+        RegDeleteValueW(run, kAppName);
+        if (ok) RegDeleteValueW(ok, kAppName);
     }
-    RegCloseKey(k);
+    RegCloseKey(run);
+    if (ok) RegCloseKey(ok);
 }
 
 // ---------------------------------------------------------------------------
@@ -1540,6 +1558,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     bool firstRun = !LoadSettings();
     if (firstRun) SaveSettings();
+    // Rewrite an existing entry: adds the StartupApproved value older builds left out, and
+    // follows the exe if it moved. A user's "disabled" in Task Manager reads as off and is kept.
+    if (AutostartEnabled()) SetAutostart(true);
 
     if (wcsstr(GetCommandLineW(), L"--debug")) {
         wchar_t path[MAX_PATH];
